@@ -1,1 +1,767 @@
+create or replace FUNCTION     FNC_GET_MEMBER_INTEREST_TBL (
+    P_ID IN NUMBER
+) RETURN SHB.MEMBER_STATUS_SUMMARY_TBL
+AS
+    rec SHB.MEMBER_STATUS_SUMMARY_TBL;
+    V_NATIONAL_CODE VARCHAR2(20);
+    V_FIRST_REG_YEAR NUMBER := 0;
+    V_MINIMUM_YEARS NUMBER := 2;
+    V_TOTAL_YEARS NUMBER := 0;
+    V_YEARS_STR VARCHAR2(4000);
+    V_FULL_PAYMENT_EXISTS NUMBER := 0;
+    V_TOTAL_MEMBER_AMOUNT NUMBER := 0;
+    V_TOTAL_ORG_AMOUNT NUMBER := 0;
+    V_TOTAL_INTEREST_AMOUNT NUMBER := 0;
+    V_ELIGIBILITY NUMBER := 0;
+    V_REASON VARCHAR2(200);
+    V_DEBUG_INFO CLOB;
+    V_CURRENT_FISCAL_YEAR NUMBER;
+    V_EXIT_CREATED DATE;
+    V_BASE_DATE DATE;
+    V_PREV_YEAR NUMBER;
+    V_PREV_MONTH NUMBER;
+    V_LAST_DAY NUMBER;
+    V_CUTOFF_DATE DATE;
+    V_END_YEAR NUMBER;
+    V_END_MONTH NUMBER;
+    V_HAS_PAYMENT NUMBER := 0;
+    V_FISCAL_YEARS VARCHAR2(4000);
+    V_YEARLY_INTEREST_JSON CLOB;
+    V_YEARLY_MEMBERSHIP_AMOUNT_JSON CLOB;
+    V_YEARLY_ORG_CONTRIBUTION_JSON CLOB;
+    V_RATE_JSON CLOB;
+    V_GROUP_CODE VARCHAR2(50) := NULL;
+    V_MEMBER_GROUP_ID NUMBER := 0;
+    V_TEMP_JSON CLOB;
+    TYPE t_yearly_data IS TABLE OF VARCHAR2(32767) INDEX BY PLS_INTEGER;
+    V_YEARLY_DATA t_yearly_data;
+    V_YEAR_COUNT NUMBER := 0;
+    cum_member NUMBER := 0;
+    cum_org NUMBER := 0;
+    V_LAST_MEMBERSHIP_FEE NUMBER := 0;
+    V_LAST_ORG_PERCENT NUMBER := 0;
+    V_LAST_RATE NUMBER := 4; -- Default rate
+BEGIN
+    -- Set Persian calendar
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_CALENDAR=''PERSIAN''';
+    V_CURRENT_FISCAL_YEAR := TO_NUMBER(TO_CHAR(SYSDATE, 'YYYY', 'nls_calendar=persian'));
+    DBMS_LOB.CREATETEMPORARY(V_DEBUG_INFO, TRUE);
+    DBMS_LOB.APPEND(V_DEBUG_INFO, 'ورودی: P_ID=' || P_ID || ', تاریخ جاری: ' || TO_CHAR(SYSDATE, 'YYYY/MM/DD HH24:MI:SS', 'nls_calendar=persian'));
+    -- Check table access
+    BEGIN
+        FOR r IN (
+            SELECT table_name
+            FROM all_tab_privs
+            WHERE table_name IN ('TBL_FISCAL_YEAR', 'TBL_CONDITION_DTL', 'TBL_MEMBER_PAY_PERIODS', 'TBL_ORGAN_PAY_DTL', 'TBL_EXIT_HISTORY')
+              AND grantee = 'SHB'
+              AND privilege = 'SELECT'
+        ) LOOP
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',دسترسی به جدول ' || r.table_name || ':OK');
+        END LOOP;
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در بررسی دسترسی به جداول:' || SQLERRM);
+    END;
+    -- Fetch national code
+    BEGIN
+        SELECT NATIONAL_CODE
+          INTO V_NATIONAL_CODE
+          FROM MUMS.TBL_MUMS_PERSON
+         WHERE ID = P_ID
+           AND ROWNUM = 1;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',کد ملی:' || NVL(V_NATIONAL_CODE, 'ناموجود'));
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            V_NATIONAL_CODE := NULL;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',کد ملی:ناموجود');
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در استخراج کد ملی:' || SQLERRM);
+            RAISE;
+    END;
+    -- Fetch minimum years
+    BEGIN
+        SELECT NVL(dtl.NUM_VALUE, 2), NVL(dtl.MEMBER_GROUP_ID, 0)
+          INTO V_MINIMUM_YEARS, V_MEMBER_GROUP_ID
+          FROM SHB.TBL_CONDITION_DTL dtl
+         WHERE dtl.CONDITION_ID = 10
+           AND dtl.FISCAL_YEAR_ID = (
+                 SELECT MAX(FISCAL_YEAR_ID)
+                   FROM SHB.TBL_CONDITION_DTL
+                  WHERE CONDITION_ID = dtl.CONDITION_ID
+               )
+           AND ROWNUM = 1;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',حداقل سال‌ها:' || V_MINIMUM_YEARS || ',شناسه گروه عضویت:' || V_MEMBER_GROUP_ID);
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            V_MINIMUM_YEARS := 2;
+            V_MEMBER_GROUP_ID := 0;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',حداقل سال‌ها:2 (پیش‌فرض),شناسه گروه عضویت:0');
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در استخراج حداقل سال‌ها:' || SQLERRM);
+            RAISE;
+    END;
+    DBMS_LOB.APPEND(V_DEBUG_INFO, ',کد گروه:' || NVL(V_GROUP_CODE, 'ناموجود'));
+    -- Fetch first registration year
+    BEGIN
+        SELECT MIN(year)
+          INTO V_FIRST_REG_YEAR
+          FROM (
+                SELECT TO_NUMBER(TO_CHAR(PAY_DATE, 'YYYY', 'nls_calendar=persian')) AS year
+                  FROM SHB.TBL_MEMBER_PAY_PERIODS
+                 WHERE PERSON_ID = P_ID
+                   AND PAY_DATE IS NOT NULL
+                   AND AMOUNT_PAID IS NOT NULL
+                UNION ALL
+                SELECT TO_NUMBER(TO_CHAR(CREATED, 'YYYY', 'nls_calendar=persian')) AS year
+                  FROM SHB.TBL_ORGAN_PAY_DTL
+                 WHERE NATION_CODE = V_NATIONAL_CODE
+                   AND CREATED IS NOT NULL
+                   AND AMOUNT IS NOT NULL
+               );
+        IF V_FIRST_REG_YEAR IS NULL THEN
+            V_FIRST_REG_YEAR := 0;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',سال اولین ثبت:ناموجود');
+        ELSE
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',سال اولین ثبت:' || V_FIRST_REG_YEAR);
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            V_FIRST_REG_YEAR := 0;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در استخراج سال اولین ثبت:' || SQLERRM);
+    END;
+    -- Count payment years
+    IF V_NATIONAL_CODE IS NOT NULL THEN
+        SELECT COUNT(DISTINCT year),
+               LISTAGG(DISTINCT year, ',') WITHIN GROUP (ORDER BY year)
+          INTO V_TOTAL_YEARS, V_YEARS_STR
+          FROM (
+                SELECT TO_NUMBER(TO_CHAR(PAY_DATE, 'YYYY', 'nls_calendar=persian')) AS year
+                  FROM SHB.TBL_MEMBER_PAY_PERIODS
+                 WHERE PERSON_ID = P_ID
+                   AND PAY_DATE IS NOT NULL
+                   AND AMOUNT_PAID IS NOT NULL
+                UNION
+                SELECT TO_NUMBER(TO_CHAR(CREATED, 'YYYY', 'nls_calendar=persian')) AS year
+                  FROM SHB.TBL_ORGAN_PAY_DTL
+                 WHERE NATION_CODE = V_NATIONAL_CODE
+                   AND CREATED IS NOT NULL
+                   AND AMOUNT IS NOT NULL
+               );
+        IF V_TOTAL_YEARS > 0 THEN
+            V_HAS_PAYMENT := 1;
+        END IF;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',سال‌های پرداخت:' || NVL(V_YEARS_STR, 'ناموجود') || ',تعداد سال‌ها:' || V_TOTAL_YEARS);
+    END IF;
+    -- Check available fiscal years
+    BEGIN
+        SELECT LISTAGG(TO_CHAR(TITLE), ',') WITHIN GROUP (ORDER BY TITLE)
+          INTO V_FISCAL_YEARS
+          FROM SHB.TBL_FISCAL_YEAR;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',سال‌های مالی موجود:' || NVL(V_FISCAL_YEARS, 'ناموجود'));
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در بررسی سال‌های مالی:' || SQLERRM);
+    END;
+    -- If current year not in TBL_FISCAL_YEAR, add error message
+    IF INSTR(V_FISCAL_YEARS, TO_CHAR(V_CURRENT_FISCAL_YEAR)) = 0 THEN
+        V_REASON := 'سال مالی جاری (' || TO_CHAR(V_CURRENT_FISCAL_YEAR) || ') در TBL_FISCAL_YEAR وجود ندارد';
+        SELECT SHB.MEMBER_STATUS_SUMMARY(
+                   eligibility => 0,
+                   total_amount => 0,
+                   member_amount => 0,
+                   org_amount => 0,
+                   total_possible_amount => 0,
+                   total_interest_amount => 0,
+                   reason => V_REASON,
+                   first_reg_year => V_FIRST_REG_YEAR,
+                   debug_info => V_DEBUG_INFO,
+                   yearly_interest => NULL,
+                   yearly_membership_amount => NULL,
+                   yearly_org_contribution => NULL,
+                   rate => NULL,
+                   exit_date => NULL
+               )
+          BULK COLLECT INTO rec
+          FROM DUAL;
+        DBMS_LOB.FREETEMPORARY(V_DEBUG_INFO);
+        RETURN rec;
+    END IF;
+    -- Check full payment existence
+    BEGIN
+        SELECT COUNT(1)
+          INTO V_FULL_PAYMENT_EXISTS
+          FROM (
+                SELECT TO_NUMBER(TO_CHAR(m.PAY_DATE, 'YYYY', 'nls_calendar=persian')) AS AMOUNT_YEAR, SUM(m.AMOUNT_PAID) AS TOTAL_PAID
+                  FROM SHB.TBL_MEMBER_PAY_PERIODS m
+                 WHERE m.PERSON_ID = P_ID
+                   AND m.PAY_DATE IS NOT NULL
+                   AND m.AMOUNT_PAID IS NOT NULL
+                 GROUP BY TO_NUMBER(TO_CHAR(m.PAY_DATE, 'YYYY', 'nls_calendar=persian'))
+               ) m
+          JOIN SHB.TBL_FISCAL_YEAR f ON m.AMOUNT_YEAR = f.TITLE
+          JOIN SHB.TBL_CONDITION_DTL cd ON cd.FISCAL_YEAR_ID = f.ID AND cd.CONDITION_ID = 1033
+     LEFT JOIN SHB.TBL_CONDITION_DTL cd2 ON cd2.FISCAL_YEAR_ID = f.ID AND cd2.CONDITION_ID = 1053
+         WHERE m.TOTAL_PAID >= cd.NUM_VALUE * (1 - NVL(cd2.NUM_VALUE / 100, 0))
+           AND ROWNUM = 1;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',وجود پرداخت کامل:' || V_FULL_PAYMENT_EXISTS);
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            V_FULL_PAYMENT_EXISTS := 0;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',وجود پرداخت کامل:0');
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در بررسی پرداخت کامل:' || SQLERRM);
+            RAISE;
+    END;
+    -- If no payments exist, return zero values
+    IF V_HAS_PAYMENT = 0 THEN
+        V_REASON := 'هیچ پرداختی یافت نشد';
+        SELECT SHB.MEMBER_STATUS_SUMMARY(
+                   eligibility => 0,
+                   total_amount => 0,
+                   member_amount => 0,
+                   org_amount => 0,
+                   total_possible_amount => 0,
+                   total_interest_amount => 0,
+                   reason => V_REASON,
+                   first_reg_year => V_FIRST_REG_YEAR,
+                   debug_info => V_DEBUG_INFO,
+                   yearly_interest => NULL,
+                   yearly_membership_amount => NULL,
+                   yearly_org_contribution => NULL,
+                   rate => NULL,
+                   exit_date => NULL
+               )
+          BULK COLLECT INTO rec
+          FROM DUAL;
+        DBMS_LOB.FREETEMPORARY(V_DEBUG_INFO);
+        RETURN rec;
+    END IF;
+    -- Determine base date for cutoff (exit or max payment date)
+    BEGIN
+        SELECT MAX(CREATED)
+          INTO V_EXIT_CREATED
+          FROM SHB.TBL_EXIT_HISTORY
+         WHERE PERSON_ID = P_ID;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',تاریخ تسویه:' || NVL(TO_CHAR(V_EXIT_CREATED, 'YYYY/MM/DD HH24:MI:SS', 'nls_calendar=persian'), 'ناموجود'));
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            V_EXIT_CREATED := NULL;
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',تاریخ تسویه:ناموجود');
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در خواندن TBL_EXIT_HISTORY:' || SQLERRM);
+            V_EXIT_CREATED := NULL;
+    END;
+    IF V_EXIT_CREATED IS NULL THEN
+        BEGIN
+            SELECT NVL(MAX(pay_date), SYSDATE)
+              INTO V_BASE_DATE
+              FROM (
+                    SELECT PAY_DATE pay_date
+                      FROM SHB.TBL_MEMBER_PAY_PERIODS
+                     WHERE PERSON_ID = P_ID
+                       AND PAY_DATE IS NOT NULL
+                       AND AMOUNT_PAID IS NOT NULL
+                    UNION ALL
+                    SELECT CREATED pay_date
+                      FROM SHB.TBL_ORGAN_PAY_DTL
+                     WHERE NATION_CODE = V_NATIONAL_CODE
+                       AND CREATED IS NOT NULL
+                       AND AMOUNT IS NOT NULL
+                   );
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',آخرین پرداخت:' || TO_CHAR(V_BASE_DATE, 'YYYY/MM/DD HH24:MI:SS', 'nls_calendar=persian'));
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                V_BASE_DATE := SYSDATE;
+                DBMS_LOB.APPEND(V_DEBUG_INFO, ',آخرین پرداخت:ناموجود, استفاده از تاریخ جاری');
+        END;
+    ELSE
+        V_BASE_DATE := V_EXIT_CREATED;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',استفاده از تاریخ تسویه:' || TO_CHAR(V_BASE_DATE, 'YYYY/MM/DD HH24:MI:SS', 'nls_calendar=persian'));
+    END IF;
+    -- Calculate previous month and year for cutoff
+    V_PREV_YEAR := TO_NUMBER(TO_CHAR(V_BASE_DATE, 'YYYY', 'nls_calendar=persian'));
+    V_PREV_MONTH := TO_NUMBER(TO_CHAR(V_BASE_DATE, 'MM', 'nls_calendar=persian')) - 1;
+    IF V_PREV_MONTH = 0 THEN
+        V_PREV_MONTH := 12;
+        V_PREV_YEAR := V_PREV_YEAR - 1;
+    END IF;
+    V_END_YEAR := V_PREV_YEAR;
+    V_END_MONTH := V_PREV_MONTH;
+    -- Calculate last day of the end month
+    IF V_END_MONTH <= 6 THEN
+        V_LAST_DAY := 31;
+    ELSIF V_END_MONTH <= 11 THEN
+        V_LAST_DAY := 30;
+    ELSE
+        IF MOD(V_END_YEAR, 33) IN (1,5,9,13,17,22,26,30) THEN
+            V_LAST_DAY := 30;
+        ELSE
+            V_LAST_DAY := 29;
+        END IF;
+    END IF;
+    V_CUTOFF_DATE := TO_DATE(V_END_YEAR || '/' || LPAD(V_END_MONTH, 2, '0') || '/' || LPAD(V_LAST_DAY, 2, '0'), 'YYYY/MM/DD', 'nls_calendar=persian');
+    DBMS_LOB.APPEND(
+        V_DEBUG_INFO,
+        ',cutoff=' || TO_CHAR(V_CUTOFF_DATE, 'YYYY/MM/DD', 'nls_calendar=persian')
+        || ',end_year=' || V_END_YEAR
+        || ',end_month=' || V_END_MONTH
+        || CASE WHEN V_EXIT_CREATED IS NOT NULL THEN ',exit_found=Y' ELSE ',exit_found=N' END
+    );
+    -- Interest calculations
+    BEGIN
+        DBMS_LOB.CREATETEMPORARY(V_YEARLY_INTEREST_JSON, TRUE);
+        DBMS_LOB.APPEND(V_YEARLY_INTEREST_JSON, '[');
+        V_LAST_MEMBERSHIP_FEE := 0;
+        V_LAST_ORG_PERCENT := 0;
+        V_LAST_RATE := 4;
+        FOR year_rec IN (
+            SELECT TO_CHAR(f.TITLE) AS FISCAL_YEAR, f.ID AS FISCAL_YEAR_ID
+              FROM SHB.TBL_FISCAL_YEAR f
+             WHERE TO_NUMBER(f.TITLE) >= V_FIRST_REG_YEAR
+               AND TO_NUMBER(f.TITLE) <= V_END_YEAR
+             ORDER BY TO_NUMBER(f.TITLE)
+        ) LOOP
+            DECLARE
+                TYPE t_payment IS RECORD (
+                    deposit_type VARCHAR2(10),
+                    deposit_date DATE,
+                    deposit_amount NUMBER,
+                    deposit_month NUMBER
+                );
+                TYPE t_payments IS TABLE OF t_payment;
+                V_PAYMENTS t_payments;
+                TYPE t_monthly IS RECORD (
+                    month NUMBER,
+                    full_days NUMBER,
+                    member_amount NUMBER,
+                    org_amount NUMBER,
+                    membership_fee NUMBER,
+                    member_payment NUMBER,
+                    org_payment NUMBER,
+                    member_interest NUMBER,
+                    organ_interest NUMBER,
+                    total_interest NUMBER
+                );
+                TYPE t_monthlies IS TABLE OF t_monthly;
+                V_MONTHLIES t_monthlies;
+                V_FISCAL_YEAR VARCHAR2(4) := year_rec.FISCAL_YEAR;
+                V_FISCAL_YEAR_ID NUMBER := year_rec.FISCAL_YEAR_ID;
+                V_PREV_MEMBER NUMBER := cum_member;
+                V_PREV_ORG NUMBER := cum_org;
+                V_MEMBERSHIP_FEE NUMBER;
+                V_ORG_PERCENT NUMBER;
+                V_RATE NUMBER;
+                V_MEMBER_AMOUNT NUMBER;
+                V_ORG_AMOUNT NUMBER;
+                V_INTEREST NUMBER := 0;
+                V_MEMBER_INTEREST NUMBER := 0;
+                V_ORGAN_INTEREST NUMBER := 0;
+                V_ACTUAL_MEMBER_PAID NUMBER;
+                V_ACTUAL_ORG_PAID NUMBER;
+                current_member_balance NUMBER;
+                current_org_balance NUMBER;
+                v_count NUMBER;
+                V_MAX_MONTH NUMBER := CASE
+                                        WHEN TO_NUMBER(V_FISCAL_YEAR) = V_END_YEAR THEN V_END_MONTH
+                                        ELSE 12
+                                      END;
+            BEGIN
+                IF TO_NUMBER(V_FISCAL_YEAR) > V_END_YEAR THEN
+                    CONTINUE;
+                END IF;
+                DBMS_LOB.APPEND(V_DEBUG_INFO, ',محاسبه برای سال مالی:' || V_FISCAL_YEAR || ',حداکثر ماه:' || V_MAX_MONTH);
+                -- Fetch conditions
+                BEGIN
+                    SELECT cd.NUM_VALUE, NVL(cd2.NUM_VALUE / 100, 0), NVL(cd3.NUM_VALUE, 4)
+                      INTO V_MEMBERSHIP_FEE, V_ORG_PERCENT, V_RATE
+                      FROM SHB.TBL_CONDITION_DTL cd
+                 LEFT JOIN SHB.TBL_CONDITION_DTL cd2 ON cd2.FISCAL_YEAR_ID = V_FISCAL_YEAR_ID AND cd2.CONDITION_ID = 1053
+                 LEFT JOIN SHB.TBL_CONDITION_DTL cd3 ON cd3.FISCAL_YEAR_ID = V_FISCAL_YEAR_ID AND cd3.CONDITION_ID = 17
+                     WHERE cd.FISCAL_YEAR_ID = V_FISCAL_YEAR_ID
+                       AND cd.CONDITION_ID = 1033;
+                    V_LAST_MEMBERSHIP_FEE := V_MEMBERSHIP_FEE;
+                    V_LAST_ORG_PERCENT := V_ORG_PERCENT;
+                    V_LAST_RATE := V_RATE;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN
+                        V_MEMBERSHIP_FEE := V_LAST_MEMBERSHIP_FEE;
+                        V_ORG_PERCENT := V_LAST_ORG_PERCENT;
+                        V_RATE := V_LAST_RATE;
+                        DBMS_LOB.APPEND(V_DEBUG_INFO, ',شرایط برای سال ' || V_FISCAL_YEAR || ' یافت نشد, استفاده از شرایط سال قبل');
+                END;
+                V_MEMBER_AMOUNT := V_MEMBERSHIP_FEE * (1 - V_ORG_PERCENT);
+                V_ORG_AMOUNT := V_MEMBERSHIP_FEE * V_ORG_PERCENT;
+                -- Actual member payments up to cutoff
+                SELECT NVL(SUM(m.AMOUNT_PAID), 0)
+                  INTO V_ACTUAL_MEMBER_PAID
+                  FROM SHB.TBL_MEMBER_PAY_PERIODS m
+                 WHERE m.PERSON_ID = P_ID
+                   AND TO_NUMBER(TO_CHAR(m.PAY_DATE, 'YYYY', 'nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                   AND m.AMOUNT_PAID IS NOT NULL
+                   AND m.PAY_DATE <= V_CUTOFF_DATE;
+                -- Actual org payments up to cutoff
+                SELECT NVL(SUM(o.AMOUNT), 0)
+                  INTO V_ACTUAL_ORG_PAID
+                  FROM SHB.TBL_ORGAN_PAY_DTL o
+                 WHERE o.NATION_CODE = V_NATIONAL_CODE
+                   AND TO_NUMBER(TO_CHAR(o.CREATED, 'YYYY', 'nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                   AND o.AMOUNT IS NOT NULL
+                   AND o.CREATED <= V_CUTOFF_DATE;
+                DBMS_LOB.APPEND(V_DEBUG_INFO, ',پرداخت عضو:' || V_ACTUAL_MEMBER_PAID || ',پرداخت سازمان:' || V_ACTUAL_ORG_PAID);
+                -- Collect payments up to cutoff
+                SELECT *
+                  BULK COLLECT INTO V_PAYMENTS
+                  FROM (
+                        SELECT 'MEMBER' deposit_type,
+                               NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')) deposit_date,
+                               m.AMOUNT_PAID deposit_amount,
+                               TO_NUMBER(TO_CHAR(NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')),
+                                                 'MM', 'nls_calendar=persian')) deposit_month
+                          FROM SHB.TBL_MEMBER_PAY_PERIODS m
+                         WHERE m.PERSON_ID = P_ID
+                           AND TO_NUMBER(TO_CHAR(m.PAY_DATE, 'YYYY', 'nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                           AND m.AMOUNT_PAID IS NOT NULL
+                           AND m.PAY_DATE <= V_CUTOFF_DATE
+                        UNION ALL
+                        SELECT 'ORG' deposit_type,
+                               NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')) deposit_date,
+                               o.AMOUNT deposit_amount,
+                               TO_NUMBER(TO_CHAR(NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')),
+                                                 'MM', 'nls_calendar=persian')) deposit_month
+                          FROM SHB.TBL_ORGAN_PAY_DTL o
+                         WHERE o.NATION_CODE = V_NATIONAL_CODE
+                           AND TO_NUMBER(TO_CHAR(o.CREATED, 'YYYY', 'nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                           AND o.AMOUNT IS NOT NULL
+                           AND o.CREATED <= V_CUTOFF_DATE
+                       );
+                -- Monthly calculations up to V_MAX_MONTH
+                SELECT MONTH, FULL_DAYS, MEMBER_AMOUNT, ORG_AMOUNT, MEMBERSHIP_FEE,
+                       MEMBER_PAYMENT, ORG_PAYMENT, MEMBER_INTEREST, ORGAN_INTEREST, TOTAL_INTEREST
+                  BULK COLLECT INTO V_MONTHLIES
+                  FROM (
+                        WITH deposit_data AS (
+                            SELECT 
+                                V_FISCAL_YEAR AS FISCAL_YEAR,
+                                m.AMOUNT_PAID AS DEPOSIT_AMOUNT,
+                                NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')) AS DEPOSIT_DATE,
+                                TO_NUMBER(TO_CHAR(NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01', 'YYYY/MM/DD', 'nls_calendar=persian')), 'MM', 'nls_calendar=persian')) AS DEPOSIT_MONTH,
+                                'MEMBER' AS DEPOSIT_TYPE,
+                                V_RATE AS RATE,
+                                CASE 
+                                  WHEN TO_NUMBER(TO_CHAR(NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'MM','nls_calendar=persian')) <= 6 THEN 31
+                                  WHEN TO_NUMBER(TO_CHAR(NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'MM','nls_calendar=persian')) <= 11 THEN 30
+                                  WHEN MOD(TO_NUMBER(V_FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29
+                                END - TO_NUMBER(TO_CHAR(NVL(m.PAY_DATE, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'DD','nls_calendar=persian')) + 1 AS REMAINING_DAYS
+                              FROM SHB.TBL_MEMBER_PAY_PERIODS m
+                             WHERE m.PERSON_ID = P_ID
+                               AND TO_NUMBER(TO_CHAR(m.PAY_DATE,'YYYY','nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                               AND m.AMOUNT_PAID IS NOT NULL
+                               AND m.PAY_DATE <= V_CUTOFF_DATE
+                            UNION ALL
+                            SELECT 
+                                V_FISCAL_YEAR,
+                                o.AMOUNT,
+                                NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),
+                                TO_NUMBER(TO_CHAR(NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'MM','nls_calendar=persian')),
+                                'ORG',
+                                V_RATE,
+                                CASE 
+                                  WHEN TO_NUMBER(TO_CHAR(NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'MM','nls_calendar=persian')) <= 6 THEN 31
+                                  WHEN TO_NUMBER(TO_CHAR(NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'MM','nls_calendar=persian')) <= 11 THEN 30
+                                  WHEN MOD(TO_NUMBER(V_FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29
+                                END - TO_NUMBER(TO_CHAR(NVL(o.CREATED, TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian')),'DD','nls_calendar=persian')) + 1
+                              FROM SHB.TBL_ORGAN_PAY_DTL o
+                             WHERE o.NATION_CODE = V_NATIONAL_CODE
+                               AND TO_NUMBER(TO_CHAR(o.CREATED,'YYYY','nls_calendar=persian')) = TO_NUMBER(V_FISCAL_YEAR)
+                               AND o.AMOUNT IS NOT NULL
+                               AND o.CREATED <= V_CUTOFF_DATE
+                            UNION ALL
+                            SELECT V_FISCAL_YEAR, V_PREV_MEMBER,
+                                   TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian'),
+                                   1, 'PREV_MEMBER', V_RATE, 31
+                              FROM DUAL
+                             WHERE V_PREV_MEMBER > 0
+                            UNION ALL
+                            SELECT V_FISCAL_YEAR, V_PREV_ORG,
+                                   TO_DATE(V_FISCAL_YEAR || '/01/01','YYYY/MM/DD','nls_calendar=persian'),
+                                   1, 'PREV_ORG', V_RATE, 31
+                              FROM DUAL
+                             WHERE V_PREV_ORG > 0
+                        ),
+                        yearly_totals AS (
+                            SELECT V_FISCAL_YEAR FISCAL_YEAR,
+                                   V_MEMBERSHIP_FEE MEMBERSHIP_FEE,
+                                   V_MEMBER_AMOUNT MEMBER_AMOUNT,
+                                   V_ORG_AMOUNT ORG_AMOUNT,
+                                   V_PREV_MEMBER PREV_MEMBER_AMOUNT,
+                                   V_PREV_ORG PREV_ORG_AMOUNT,
+                                   V_RATE RATE
+                              FROM DUAL
+                        ),
+                        monthly_calcs AS (
+                            SELECT 
+                                dd.FISCAL_YEAR,
+                                m.MONTH,
+                                dd.DEPOSIT_AMOUNT,
+                                dd.DEPOSIT_TYPE,
+                                dd.DEPOSIT_MONTH,
+                                dd.DEPOSIT_DATE,
+                                dd.RATE,
+                                CASE WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END AS TOTAL_DAYS,
+                                CASE 
+                                  WHEN m.MONTH <= 6 THEN 31
+                                  WHEN m.MONTH <= 11 THEN 30
+                                  WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29
+                                END AS FULL_DAYS,
+                                CASE 
+                                  WHEN m.MONTH = dd.DEPOSIT_MONTH THEN dd.REMAINING_DAYS 
+                                  WHEN m.MONTH > dd.DEPOSIT_MONTH THEN 
+                                       CASE WHEN m.MONTH <= 6 THEN 31
+                                            WHEN m.MONTH <= 11 THEN 30
+                                            WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29 END
+                                  ELSE 0 
+                                END AS DAYS,
+                                CASE 
+                                  WHEN dd.DEPOSIT_TYPE LIKE 'PREV%' THEN 0
+                                  WHEN m.MONTH = dd.DEPOSIT_MONTH THEN dd.DEPOSIT_AMOUNT ELSE 0 
+                                END AS MONTHLY_PAYMENT,
+                                CASE 
+                                  WHEN m.MONTH = dd.DEPOSIT_MONTH THEN ROUND(dd.DEPOSIT_AMOUNT * dd.RATE * dd.REMAINING_DAYS / (CASE WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END), 2)
+                                  WHEN m.MONTH > dd.DEPOSIT_MONTH THEN ROUND(dd.DEPOSIT_AMOUNT * dd.RATE * (CASE WHEN m.MONTH <= 6 THEN 31 WHEN m.MONTH <= 11 THEN 30 WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29 END) / (CASE WHEN MOD(TO_NUMBER(dd.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END), 2)
+                                  ELSE 0 
+                                END AS MONTHLY_INTEREST
+                              FROM deposit_data dd
+                              CROSS JOIN (SELECT LEVEL AS MONTH FROM DUAL CONNECT BY LEVEL <= V_MAX_MONTH) m
+                             WHERE m.MONTH >= dd.DEPOSIT_MONTH
+                        ),
+                        monthly_details AS (
+                            SELECT 
+                                yt.FISCAL_YEAR,
+                                m.MONTH,
+                                CASE 
+                                  WHEN m.MONTH <= 6 THEN 31
+                                  WHEN m.MONTH <= 11 THEN 30
+                                  WHEN MOD(TO_NUMBER(yt.FISCAL_YEAR),33) IN (1,5,9,13,17,22,26,30) THEN 30 ELSE 29
+                                END AS FULL_DAYS,
+                                yt.MEMBER_AMOUNT,
+                                yt.ORG_AMOUNT,
+                                yt.MEMBERSHIP_FEE,
+                                NVL(SUM(CASE WHEN mc.DEPOSIT_TYPE = 'MEMBER' THEN mc.MONTHLY_PAYMENT ELSE 0 END), 0) AS MEMBER_PAYMENT,
+                                NVL(SUM(CASE WHEN mc.DEPOSIT_TYPE = 'ORG' THEN mc.MONTHLY_PAYMENT ELSE 0 END), 0) AS ORG_PAYMENT,
+                                NVL(SUM(CASE WHEN mc.DEPOSIT_TYPE IN ('MEMBER','PREV_MEMBER') THEN mc.MONTHLY_INTEREST ELSE 0 END), 0) AS MEMBER_INTEREST,
+                                NVL(SUM(CASE WHEN mc.DEPOSIT_TYPE IN ('ORG','PREV_ORG') THEN mc.MONTHLY_INTEREST ELSE 0 END), 0) AS ORGAN_INTEREST,
+                                NVL(SUM(mc.MONTHLY_INTEREST), 0) AS TOTAL_INTEREST
+                              FROM yearly_totals yt
+                              CROSS JOIN (SELECT LEVEL AS MONTH FROM DUAL CONNECT BY LEVEL <= V_MAX_MONTH) m
+                              LEFT JOIN monthly_calcs mc
+                                     ON yt.FISCAL_YEAR = mc.FISCAL_YEAR
+                                    AND m.MONTH = mc.MONTH
+                             GROUP BY yt.FISCAL_YEAR, m.MONTH, yt.MEMBER_AMOUNT, yt.ORG_AMOUNT, yt.MEMBERSHIP_FEE
+                        )
+                        SELECT MONTH, FULL_DAYS, MEMBER_AMOUNT, ORG_AMOUNT, MEMBERSHIP_FEE,
+                               MEMBER_PAYMENT, ORG_PAYMENT, MEMBER_INTEREST, ORGAN_INTEREST, TOTAL_INTEREST
+                          FROM monthly_details
+                         ORDER BY MONTH
+                  );
+                -- Sum yearly interest
+                V_INTEREST := 0; V_MEMBER_INTEREST := 0; V_ORGAN_INTEREST := 0;
+                FOR i IN 1..V_MONTHLIES.COUNT LOOP
+                    V_INTEREST := V_INTEREST + V_MONTHLIES(i).TOTAL_INTEREST;
+                    V_MEMBER_INTEREST := V_MEMBER_INTEREST + V_MONTHLIES(i).MEMBER_INTEREST;
+                    V_ORGAN_INTEREST := V_ORGAN_INTEREST + V_MONTHLIES(i).ORGAN_INTEREST;
+                END LOOP;
+                -- Update totals
+                V_TOTAL_MEMBER_AMOUNT := V_TOTAL_MEMBER_AMOUNT + V_ACTUAL_MEMBER_PAID;
+                V_TOTAL_ORG_AMOUNT := V_TOTAL_ORG_AMOUNT + V_ACTUAL_ORG_PAID;
+                V_TOTAL_INTEREST_AMOUNT := V_TOTAL_INTEREST_AMOUNT + V_INTEREST;
+                -- Update cumulative
+                cum_member := V_PREV_MEMBER + V_ACTUAL_MEMBER_PAID + V_MEMBER_INTEREST;
+                cum_org := V_PREV_ORG + V_ACTUAL_ORG_PAID + V_ORGAN_INTEREST;
+                -- Build yearly JSON
+                V_YEAR_COUNT := V_YEAR_COUNT + 1;
+                DBMS_LOB.CREATETEMPORARY(V_TEMP_JSON, TRUE);
+                DBMS_LOB.APPEND(V_TEMP_JSON, '{');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"year":"' || V_FISCAL_YEAR || '",');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"interest":' || TO_CHAR(V_INTEREST) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"rate":' || TO_CHAR(V_RATE) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"org_contribution_percent":' || TO_CHAR(V_ORG_PERCENT * 100) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"member_contribution_percent":' || TO_CHAR((1 - V_ORG_PERCENT) * 100) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"org_contribution_amount":' || TO_CHAR(V_ORG_AMOUNT) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"member_contribution_amount":' || TO_CHAR(V_MEMBER_AMOUNT) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"membership_amount":' || TO_CHAR(V_MEMBER_AMOUNT) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"membership_fee":' || TO_CHAR(V_MEMBERSHIP_FEE) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"org_paid_amount":' || TO_CHAR(V_ACTUAL_ORG_PAID) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"member_paid_amount":' || TO_CHAR(V_ACTUAL_MEMBER_PAID) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"prev_member_amount":' || TO_CHAR(V_PREV_MEMBER) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"prev_org_amount":' || TO_CHAR(V_PREV_ORG) || ',');
+                DBMS_LOB.APPEND(V_TEMP_JSON, '"monthly_details":[');
+                -- Monthly balance
+                current_member_balance := V_PREV_MEMBER;
+                current_org_balance := V_PREV_ORG;
+                FOR i IN 1..V_MONTHLIES.COUNT LOOP
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '{');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"month":' || V_MONTHLIES(i).month || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"days":' || V_MONTHLIES(i).full_days || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"member_amount":' || TO_CHAR(V_MONTHLIES(i).member_amount) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"org_amount":' || TO_CHAR(V_MONTHLIES(i).org_amount) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"membership_fee":' || TO_CHAR(V_MONTHLIES(i).membership_fee) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"member_payment":' || TO_CHAR(V_MONTHLIES(i).member_payment) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"org_payment":' || TO_CHAR(V_MONTHLIES(i).org_payment) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"member_interest":' || TO_CHAR(V_MONTHLIES(i).member_interest) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"organ_interest":' || TO_CHAR(V_MONTHLIES(i).organ_interest) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"total_interest":' || TO_CHAR(V_MONTHLIES(i).total_interest) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"prev_member_amount":' || TO_CHAR(current_member_balance) || ',');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"prev_org_amount":' || TO_CHAR(current_org_balance) || ',');
+                    -- payments
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '"payments":[');
+                    v_count := 0;
+                    FOR j IN 1..V_PAYMENTS.COUNT LOOP
+                        IF V_PAYMENTS(j).deposit_month = V_MONTHLIES(i).month THEN
+                            IF v_count > 0 THEN
+                                DBMS_LOB.APPEND(V_TEMP_JSON, ',');
+                            END IF;
+                            v_count := v_count + 1;
+                            DBMS_LOB.APPEND(
+                                V_TEMP_JSON,
+                                '{"type":"' || V_PAYMENTS(j).deposit_type ||
+                                '","date":' || CASE WHEN V_PAYMENTS(j).deposit_date IS NULL THEN 'null'
+                                                    ELSE '"' || TO_CHAR(V_PAYMENTS(j).deposit_date, 'YYYY/MM/DD', 'nls_calendar=persian') || '"' END ||
+                                ',"amount":' || TO_CHAR(V_PAYMENTS(j).deposit_amount) || '}'
+                            );
+                        END IF;
+                    END LOOP;
+                    IF v_count = 0 THEN
+                        DBMS_LOB.APPEND(V_TEMP_JSON, '{"type":"none","date":null,"amount":0}');
+                    END IF;
+                    DBMS_LOB.APPEND(V_TEMP_JSON, ']');
+                    DBMS_LOB.APPEND(V_TEMP_JSON, '}');
+                    IF i < V_MONTHLIES.COUNT THEN
+                        DBMS_LOB.APPEND(V_TEMP_JSON, ',');
+                    END IF;
+                    -- Update balance
+                    current_member_balance := current_member_balance + V_MONTHLIES(i).member_payment + V_MONTHLIES(i).member_interest;
+                    current_org_balance := current_org_balance + V_MONTHLIES(i).org_payment + V_MONTHLIES(i).organ_interest;
+                END LOOP;
+                DBMS_LOB.APPEND(V_TEMP_JSON, ']}');
+                V_YEARLY_DATA(V_YEAR_COUNT) := V_TEMP_JSON;
+                DBMS_LOB.FREETEMPORARY(V_TEMP_JSON);
+            END;
+        END LOOP;
+        -- Assemble yearly JSON
+        FOR i IN 1..V_YEAR_COUNT LOOP
+            IF i > 1 THEN
+                DBMS_LOB.APPEND(V_YEARLY_INTEREST_JSON, ',');
+            END IF;
+            DBMS_LOB.APPEND(V_YEARLY_INTEREST_JSON, V_YEARLY_DATA(i));
+        END LOOP;
+        DBMS_LOB.APPEND(V_YEARLY_INTEREST_JSON, ']');
+        -- Build complementary JSONs
+        DBMS_LOB.CREATETEMPORARY(V_YEARLY_MEMBERSHIP_AMOUNT_JSON, TRUE);
+        DBMS_LOB.CREATETEMPORARY(V_YEARLY_ORG_CONTRIBUTION_JSON, TRUE);
+        DBMS_LOB.CREATETEMPORARY(V_RATE_JSON, TRUE);
+        DBMS_LOB.APPEND(V_YEARLY_MEMBERSHIP_AMOUNT_JSON, '[');
+        DBMS_LOB.APPEND(V_YEARLY_ORG_CONTRIBUTION_JSON, '[');
+        DBMS_LOB.APPEND(V_RATE_JSON, '[');
+        FOR i IN 1..V_YEAR_COUNT LOOP
+            DECLARE
+                v_year VARCHAR2(10);
+                v_member_amount NUMBER;
+                v_org_amount NUMBER;
+                v_rate NUMBER;
+            BEGIN
+                v_year := REGEXP_SUBSTR(V_YEARLY_DATA(i), '"year":"([^"]+)"', 1, 1, NULL, 1);
+                v_member_amount := TO_NUMBER(REGEXP_SUBSTR(V_YEARLY_DATA(i), '"member_paid_amount":([0-9.]+)', 1, 1, NULL, 1));
+                v_org_amount := TO_NUMBER(REGEXP_SUBSTR(V_YEARLY_DATA(i), '"org_paid_amount":([0-9.]+)', 1, 1, NULL, 1));
+                v_rate := TO_NUMBER(REGEXP_SUBSTR(V_YEARLY_DATA(i), '"rate":([0-9.]+)', 1, 1, NULL, 1));
+                IF i > 1 THEN
+                    DBMS_LOB.APPEND(V_YEARLY_MEMBERSHIP_AMOUNT_JSON, ',');
+                    DBMS_LOB.APPEND(V_YEARLY_ORG_CONTRIBUTION_JSON, ',');
+                    DBMS_LOB.APPEND(V_RATE_JSON, ',');
+                END IF;
+                DBMS_LOB.APPEND(V_YEARLY_MEMBERSHIP_AMOUNT_JSON, '{"year":"' || v_year || '","membership_amount":' || v_member_amount || '}');
+                DBMS_LOB.APPEND(V_YEARLY_ORG_CONTRIBUTION_JSON, '{"year":"' || v_year || '","org_contribution":' || v_org_amount || '}');
+                DBMS_LOB.APPEND(V_RATE_JSON, '{"year":"' || v_year || '","rate":' || v_rate || '}');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا در استخراج جزئیات سالانه[' || i || ']:' || SQLERRM);
+            END;
+        END LOOP;
+        DBMS_LOB.APPEND(V_YEARLY_MEMBERSHIP_AMOUNT_JSON, ']');
+        DBMS_LOB.APPEND(V_YEARLY_ORG_CONTRIBUTION_JSON, ']');
+        DBMS_LOB.APPEND(V_RATE_JSON, ']');
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',طول JSON سالانه:' || DBMS_LOB.GETLENGTH(V_YEARLY_INTEREST_JSON) || ',مجموع سود:' || V_TOTAL_INTEREST_AMOUNT);
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_LOB.APPEND(V_DEBUG_INFO, ',مجموع سود:0,خطا در محاسبه سود:' || SQLERRM);
+            V_TOTAL_INTEREST_AMOUNT := 0;
+    END;
+    -- Determine eligibility
+    IF V_TOTAL_YEARS < V_MINIMUM_YEARS THEN
+        V_ELIGIBILITY := 0;
+        V_REASON := 'تعداد سال کمتر از ' || V_MINIMUM_YEARS || ' سال';
+    ELSIF V_FULL_PAYMENT_EXISTS = 0 THEN
+        V_ELIGIBILITY := 0;
+        V_REASON := 'عدم پرداخت کامل حداقل یک سال';
+    ELSE
+        V_ELIGIBILITY := 1;
+        V_REASON := 'واجد شرایط برای سود و وضعیت عضویت';
+    END IF;
+    -- Return result
+    SELECT SHB.MEMBER_STATUS_SUMMARY(
+               eligibility => V_ELIGIBILITY,
+               total_amount => V_TOTAL_MEMBER_AMOUNT + V_TOTAL_ORG_AMOUNT + V_TOTAL_INTEREST_AMOUNT,
+               member_amount => V_TOTAL_MEMBER_AMOUNT,
+               org_amount => V_TOTAL_ORG_AMOUNT,
+               total_possible_amount => V_TOTAL_MEMBER_AMOUNT + V_TOTAL_ORG_AMOUNT + V_TOTAL_INTEREST_AMOUNT,
+               total_interest_amount => V_TOTAL_INTEREST_AMOUNT,
+               reason => V_REASON,
+               first_reg_year => V_FIRST_REG_YEAR,
+               debug_info => V_DEBUG_INFO,
+               yearly_interest => V_YEARLY_INTEREST_JSON,
+               yearly_membership_amount => V_YEARLY_MEMBERSHIP_AMOUNT_JSON,
+               yearly_org_contribution => V_YEARLY_ORG_CONTRIBUTION_JSON,
+               rate => V_RATE_JSON,
+               exit_date => V_EXIT_CREATED
+           )
+      BULK COLLECT INTO rec
+      FROM DUAL;
+    -- Free resources
+    DBMS_LOB.FREETEMPORARY(V_DEBUG_INFO);
+    DBMS_LOB.FREETEMPORARY(V_YEARLY_INTEREST_JSON);
+    DBMS_LOB.FREETEMPORARY(V_YEARLY_MEMBERSHIP_AMOUNT_JSON);
+    DBMS_LOB.FREETEMPORARY(V_YEARLY_ORG_CONTRIBUTION_JSON);
+    DBMS_LOB.FREETEMPORARY(V_RATE_JSON);
+    RETURN rec;
+EXCEPTION
+    WHEN OTHERS THEN
+        V_REASON := 'خطای غیرمنتظره: ' || SQLERRM;
+        DBMS_LOB.APPEND(V_DEBUG_INFO, ',خطا:' || SQLERRM);
+        SELECT SHB.MEMBER_STATUS_SUMMARY(
+                   eligibility => 0,
+                   total_amount => 0,
+                   member_amount => 0,
+                   org_amount => 0,
+                   total_possible_amount => 0,
+                   total_interest_amount => 0,
+                   reason => V_REASON,
+                   first_reg_year => V_FIRST_REG_YEAR,
+                   debug_info => V_DEBUG_INFO,
+                   yearly_interest => NULL,
+                   yearly_membership_amount => NULL,
+                   yearly_org_contribution => NULL,
+                   rate => NULL,
+                   exit_date => V_EXIT_CREATED
+               )
+          BULK COLLECT INTO rec
+          FROM DUAL;
+        DBMS_LOB.FREETEMPORARY(V_DEBUG_INFO);
+        RETURN rec;
+END FNC_GET_MEMBER_INTEREST_TBL;
+/
+
+
+
+1	41163282.58	28765044	6054330	41163282.58	6343908.58	واجد شرایط برای سود و وضعیت عضویت	1399	ورودی: P_ID=9362, تاریخ جاری: 1404/06/10 14:26:35,کد ملی:1121915061,حداقل سال‌ها:2 (پیش‌فرض),شناسه گروه عضویت:0,کد گروه:ناموجود,سال اولین ثبت:1399,سال‌های پرداخت:1399,1400,1401,1402,1403,1404,تعداد سال‌ها:6,سال‌های مالی موجود:1397,1398,1399,1400,1401,1402,1403,1404,1405,1406,1407,1408,1409,1410,1411,وجود پرداخت کامل:1,تاریخ تسویه:1405/04/01 11:02:59,استفاده از تاریخ تسویه:1405/04/01 11:02:59,cutoff=1405/03/31,end_year=1405,end_month=3,exit_found=Y,محاسبه برای سال مالی:1399,حداکثر ماه:12,پرداخت عضو:1811828,پرداخت سازمان:776500,محاسبه برای سال مالی:1400,حداکثر ماه:12,پرداخت عضو:2588314,پرداخت سازمان:647078,محاسبه برای سال مالی:1401,حداکثر ماه:12,پرداخت عضو:810000,پرداخت سازمان:0,محاسبه برای سال مالی:1402,حداکثر ماه:12,پرداخت عضو:2430000,پرداخت سازمان:4630752,محاسبه برای سال مالی:1403,حداکثر ماه:12,پرداخت عضو:5124902,پرداخت سازمان:0,محاسبه برای سال مالی:1404,حداکثر ماه:12,پرداخت عضو:16000000,پرداخت سازمان:0,محاسبه برای سال مالی:1405,حداکثر ماه:3,شرایط برای سال 1405 یافت نشد, استفاده از شرایط سال قبل,پرداخت عضو:0,پرداخت سازمان:0,طول JSON سالانه:26471,مجموع سود:6343908.58	[{"year":"1399","interest":110322.16,"rate":13,"org_contribution_percent":30,"member_contribution_percent":70,"org_contribution_amount":776498.4,"member_contribution_amount":1811829.6,"membership_amount":1811829.6,"membership_fee":2588328,"org_paid_amount":776500,"member_paid_amount":1811828,"prev_member_amount":0,"prev_org_amount":0,"monthly_details":[{"month":1,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":5,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":0,"organ_interest":0,"total_interest":0,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"none","date":null,"amount":0}]},{"month":9,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":1811828,"org_payment":776500,"member_interest":19306.36,"organ_interest":8274.18,"total_interest":27580.54,"prev_member_amount":0,"prev_org_amount":0,"payments":[{"type":"MEMBER","date":"1399/09/01","amount":1811828},{"type":"ORG","date":"1399/09/01","amount":776500}]},{"month":10,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":19306.36,"organ_interest":8274.18,"total_interest":27580.54,"prev_member_amount":1831134.36,"prev_org_amount":784774.18,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":19306.36,"organ_interest":8274.18,"total_interest":27580.54,"prev_member_amount":1850440.72,"prev_org_amount":793048.36,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":30,"member_amount":1811829.6,"org_amount":776498.4,"membership_fee":2588328,"member_payment":0,"org_payment":0,"member_interest":19306.36,"organ_interest":8274.18,"total_interest":27580.54,"prev_member_amount":1869747.08,"prev_org_amount":801322.54,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1400","interest":150848.25,"rate":4,"org_contribution_percent":20,"member_contribution_percent":80,"org_contribution_amount":647078.4,"member_contribution_amount":2588313.6,"membership_amount":2588313.6,"membership_fee":3235392,"org_paid_amount":647078,"member_paid_amount":2588314,"prev_member_amount":1889053.44,"prev_org_amount":809596.72,"monthly_details":[{"month":1,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1889053.44,"prev_org_amount":809596.72,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1895471.05,"prev_org_amount":812347.13,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1901888.66,"prev_org_amount":815097.54,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1908306.27,"prev_org_amount":817847.95,"payments":[{"type":"none","date":null,"amount":0}]},{"month":5,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1914723.88,"prev_org_amount":820598.36,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6417.61,"organ_interest":2750.41,"total_interest":9168.02,"prev_member_amount":1921141.49,"prev_org_amount":823348.77,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":6210.59,"organ_interest":2661.69,"total_interest":8872.28,"prev_member_amount":1927559.1,"prev_org_amount":826099.18,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":2588314,"org_payment":647078,"member_interest":6777.89,"organ_interest":2803.52,"total_interest":9581.41,"prev_member_amount":1933769.69,"prev_org_amount":828760.87,"payments":[{"type":"MEMBER","date":"1400/08/29","amount":2588314},{"type":"ORG","date":"1400/08/29","amount":647078}]},{"month":9,"days":30,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":14720.12,"organ_interest":4789.07,"total_interest":19509.19,"prev_member_amount":4528861.58,"prev_org_amount":1478642.39,"payments":[{"type":"none","date":null,"amount":0}]},{"month":10,"days":30,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":14720.12,"organ_interest":4789.07,"total_interest":19509.19,"prev_member_amount":4543581.7,"prev_org_amount":1483431.46,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":14720.12,"organ_interest":4789.07,"total_interest":19509.19,"prev_member_amount":4558301.82,"prev_org_amount":1488220.53,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":29,"member_amount":2588313.6,"org_amount":647078.4,"membership_fee":3235392,"member_payment":0,"org_payment":0,"member_interest":14229.44,"organ_interest":4629.43,"total_interest":18858.87,"prev_member_amount":4573021.94,"prev_org_amount":1493009.6,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1401","interest":266386.26,"rate":4,"org_contribution_percent":0,"member_contribution_percent":100,"org_contribution_amount":0,"member_contribution_amount":810000,"membership_amount":810000,"membership_fee":810000,"org_paid_amount":0,"member_paid_amount":810000,"prev_member_amount":4587251.38,"prev_org_amount":1497639.03,"monthly_details":[{"month":1,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":15584.09,"organ_interest":5087.87,"total_interest":20671.96,"prev_member_amount":4587251.38,"prev_org_amount":1497639.03,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":15584.09,"organ_interest":5087.87,"total_interest":20671.96,"prev_member_amount":4602835.47,"prev_org_amount":1502726.9,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":15584.09,"organ_interest":5087.87,"total_interest":20671.96,"prev_member_amount":4618419.56,"prev_org_amount":1507814.77,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":810000,"org_payment":0,"member_interest":17181.9,"organ_interest":5087.87,"total_interest":22269.77,"prev_member_amount":4634003.65,"prev_org_amount":1512902.64,"payments":[{"type":"MEMBER","date":"1401/04/14","amount":810000}]},{"month":5,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":18335.87,"organ_interest":5087.87,"total_interest":23423.74,"prev_member_amount":5461185.55,"prev_org_amount":1517990.51,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":18335.87,"organ_interest":5087.87,"total_interest":23423.74,"prev_member_amount":5479521.42,"prev_org_amount":1523078.38,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17744.38,"organ_interest":4923.74,"total_interest":22668.12,"prev_member_amount":5497857.29,"prev_org_amount":1528166.25,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17744.38,"organ_interest":4923.74,"total_interest":22668.12,"prev_member_amount":5515601.67,"prev_org_amount":1533089.99,"payments":[{"type":"none","date":null,"amount":0}]},{"month":9,"days":30,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17744.38,"organ_interest":4923.74,"total_interest":22668.12,"prev_member_amount":5533346.05,"prev_org_amount":1538013.73,"payments":[{"type":"none","date":null,"amount":0}]},{"month":10,"days":30,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17744.38,"organ_interest":4923.74,"total_interest":22668.12,"prev_member_amount":5551090.43,"prev_org_amount":1542937.47,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17744.38,"organ_interest":4923.74,"total_interest":22668.12,"prev_member_amount":5568834.81,"prev_org_amount":1547861.21,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":29,"member_amount":810000,"org_amount":0,"membership_fee":810000,"member_payment":0,"org_payment":0,"member_interest":17152.91,"organ_interest":4759.62,"total_interest":21912.53,"prev_member_amount":5586579.19,"prev_org_amount":1552784.95,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1402","interest":266989.71,"rate":2,"org_contribution_percent":66,"member_contribution_percent":34,"org_contribution_amount":4660096.32,"member_contribution_amount":2400655.68,"membership_amount":2400655.68,"membership_fee":7060752,"org_paid_amount":4630752,"member_paid_amount":2430000,"prev_member_amount":5603732.1,"prev_org_amount":1557544.57,"monthly_details":[{"month":1,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":810000,"org_payment":0,"member_interest":10894.56,"organ_interest":2645.69,"total_interest":13540.25,"prev_member_amount":5603732.1,"prev_org_amount":1557544.57,"payments":[{"type":"MEMBER","date":"1402/01/01","amount":810000}]},{"month":2,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":1620000,"org_payment":4630752,"member_interest":11693.46,"organ_interest":5631.39,"total_interest":17324.85,"prev_member_amount":6424626.66,"prev_org_amount":1560190.26,"payments":[{"type":"MEMBER","date":"1402/02/23","amount":1620000},{"type":"ORG","date":"1402/02/20","amount":4270752},{"type":"ORG","date":"1402/02/23","amount":360000}]},{"month":3,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13646.34,"organ_interest":10511.63,"total_interest":24157.97,"prev_member_amount":8056320.12,"prev_org_amount":6196573.65,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13646.34,"organ_interest":10511.63,"total_interest":24157.97,"prev_member_amount":8069966.46,"prev_org_amount":6207085.28,"payments":[{"type":"none","date":null,"amount":0}]},{"month":5,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13646.34,"organ_interest":10511.63,"total_interest":24157.97,"prev_member_amount":8083612.8,"prev_org_amount":6217596.91,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13646.34,"organ_interest":10511.63,"total_interest":24157.97,"prev_member_amount":8097259.14,"prev_org_amount":6228108.54,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13206.13,"organ_interest":10172.54,"total_interest":23378.67,"prev_member_amount":8110905.48,"prev_org_amount":6238620.17,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13206.13,"organ_interest":10172.54,"total_interest":23378.67,"prev_member_amount":8124111.61,"prev_org_amount":6248792.71,"payments":[{"type":"none","date":null,"amount":0}]},{"month":9,"days":30,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13206.13,"organ_interest":10172.54,"total_interest":23378.67,"prev_member_amount":8137317.74,"prev_org_amount":6258965.25,"payments":[{"type":"none","date":null,"amount":0}]},{"month":10,"days":30,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13206.13,"organ_interest":10172.54,"total_interest":23378.67,"prev_member_amount":8150523.87,"prev_org_amount":6269137.79,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":13206.13,"organ_interest":10172.54,"total_interest":23378.67,"prev_member_amount":8163730,"prev_org_amount":6279310.33,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":29,"member_amount":2400655.68,"org_amount":4660096.32,"membership_fee":7060752,"member_payment":0,"org_payment":0,"member_interest":12765.93,"organ_interest":9833.45,"total_interest":22599.38,"prev_member_amount":8176936.13,"prev_org_amount":6289482.87,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1403","interest":320585.81,"rate":2,"org_contribution_percent":0,"member_contribution_percent":100,"org_contribution_amount":0,"member_contribution_amount":5124902,"membership_amount":5124902,"membership_fee":5124902,"org_paid_amount":0,"member_paid_amount":5124902,"prev_member_amount":8189702.06,"prev_org_amount":6299316.32,"monthly_details":[{"month":1,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8189702.06,"prev_org_amount":6299316.32,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8203575.33,"prev_org_amount":6309987.29,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8217448.6,"prev_org_amount":6320658.26,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8231321.87,"prev_org_amount":6331329.23,"payments":[{"type":"none","date":null,"amount":0}]},{"month":5,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8245195.14,"prev_org_amount":6342000.2,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13873.27,"organ_interest":10670.97,"total_interest":24544.24,"prev_member_amount":8259068.41,"prev_org_amount":6352671.17,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13425.74,"organ_interest":10326.75,"total_interest":23752.49,"prev_member_amount":8272941.68,"prev_org_amount":6363342.14,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":13425.74,"organ_interest":10326.75,"total_interest":23752.49,"prev_member_amount":8286367.42,"prev_org_amount":6373668.89,"payments":[{"type":"none","date":null,"amount":0}]},{"month":9,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":5124902,"org_payment":0,"member_interest":19026.73,"organ_interest":10326.75,"total_interest":29353.48,"prev_member_amount":8299793.16,"prev_org_amount":6383995.64,"payments":[{"type":"MEMBER","date":"1403/09/11","amount":5124902}]},{"month":10,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":21827.22,"organ_interest":10326.75,"total_interest":32153.97,"prev_member_amount":13443721.89,"prev_org_amount":6394322.39,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":21827.22,"organ_interest":10326.75,"total_interest":32153.97,"prev_member_amount":13465549.11,"prev_org_amount":6404649.14,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":30,"member_amount":5124902,"org_amount":0,"membership_fee":5124902,"member_payment":0,"org_payment":0,"member_interest":21827.22,"organ_interest":10326.75,"total_interest":32153.97,"prev_member_amount":13487376.33,"prev_org_amount":6414975.89,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1404","interest":3713463.58,"rate":15,"org_contribution_percent":25,"member_contribution_percent":75,"org_contribution_amount":1500000,"member_contribution_amount":4500000,"membership_amount":4500000,"membership_fee":6000000,"org_paid_amount":0,"member_paid_amount":16000000,"prev_member_amount":13509203.55,"prev_org_amount":6425302.64,"monthly_details":[{"month":1,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":13509203.55,"prev_org_amount":6425302.64,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":13681307.1,"prev_org_amount":6507159.24,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":13853410.65,"prev_org_amount":6589015.84,"payments":[{"type":"none","date":null,"amount":0}]},{"month":4,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":14025514.2,"prev_org_amount":6670872.44,"payments":[{"type":"none","date":null,"amount":0}]},{"month":5,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":14197617.75,"prev_org_amount":6752729.04,"payments":[{"type":"none","date":null,"amount":0}]},{"month":6,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":172103.55,"organ_interest":81856.6,"total_interest":253960.15,"prev_member_amount":14369721.3,"prev_org_amount":6834585.64,"payments":[{"type":"none","date":null,"amount":0}]},{"month":7,"days":30,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":166551.82,"organ_interest":79216.06,"total_interest":245767.88,"prev_member_amount":14541824.85,"prev_org_amount":6916442.24,"payments":[{"type":"none","date":null,"amount":0}]},{"month":8,"days":30,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":166551.82,"organ_interest":79216.06,"total_interest":245767.88,"prev_member_amount":14708376.67,"prev_org_amount":6995658.3,"payments":[{"type":"none","date":null,"amount":0}]},{"month":9,"days":30,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":16000000,"org_payment":0,"member_interest":304634.01,"organ_interest":79216.06,"total_interest":383850.07,"prev_member_amount":14874928.49,"prev_org_amount":7074874.36,"payments":[{"type":"MEMBER","date":"1404/09/10","amount":16000000}]},{"month":10,"days":30,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":363812.09,"organ_interest":79216.06,"total_interest":443028.15,"prev_member_amount":31179562.5,"prev_org_amount":7154090.42,"payments":[{"type":"none","date":null,"amount":0}]},{"month":11,"days":30,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":363812.09,"organ_interest":79216.06,"total_interest":443028.15,"prev_member_amount":31543374.59,"prev_org_amount":7233306.48,"payments":[{"type":"none","date":null,"amount":0}]},{"month":12,"days":29,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":351685.03,"organ_interest":76575.52,"total_interest":428260.55,"prev_member_amount":31907186.68,"prev_org_amount":7312522.54,"payments":[{"type":"none","date":null,"amount":0}]}]},{"year":"1405","interest":1515312.81,"rate":15,"org_contribution_percent":25,"member_contribution_percent":75,"org_contribution_amount":1500000,"member_contribution_amount":4500000,"membership_amount":4500000,"membership_fee":6000000,"org_paid_amount":0,"member_paid_amount":0,"prev_member_amount":32258871.71,"prev_org_amount":7389098.06,"monthly_details":[{"month":1,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":410969.19,"organ_interest":94135.08,"total_interest":505104.27,"prev_member_amount":32258871.71,"prev_org_amount":7389098.06,"payments":[{"type":"none","date":null,"amount":0}]},{"month":2,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":410969.19,"organ_interest":94135.08,"total_interest":505104.27,"prev_member_amount":32669840.9,"prev_org_amount":7483233.14,"payments":[{"type":"none","date":null,"amount":0}]},{"month":3,"days":31,"member_amount":4500000,"org_amount":1500000,"membership_fee":6000000,"member_payment":0,"org_payment":0,"member_interest":410969.19,"organ_interest":94135.08,"total_interest":505104.27,"prev_member_amount":33080810.09,"prev_org_amount":7577368.22,"payments":[{"type":"none","date":null,"amount":0}]}]}]	[{"year":"1399","membership_amount":1811828},{"year":"1400","membership_amount":2588314},{"year":"1401","membership_amount":810000},{"year":"1402","membership_amount":2430000},{"year":"1403","membership_amount":5124902},{"year":"1404","membership_amount":16000000},{"year":"1405","membership_amount":0}]	[{"year":"1399","org_contribution":776500},{"year":"1400","org_contribution":647078},{"year":"1401","org_contribution":0},{"year":"1402","org_contribution":4630752},{"year":"1403","org_contribution":0},{"year":"1404","org_contribution":0},{"year":"1405","org_contribution":0}]	[{"year":"1399","rate":13},{"year":"1400","rate":4},{"year":"1401","rate":4},{"year":"1402","rate":2},{"year":"1403","rate":2},{"year":"1404","rate":15},{"year":"1405","rate":15}]	22-JUN-26
+
+
 
