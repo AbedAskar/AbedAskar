@@ -1,0 +1,52 @@
+SELECT 
+    y.id,
+    y.person_id,
+    y.exit_type,
+    y.status,
+    y.ok_jazb,
+    y.ok_mali,
+    y.created,
+    y.description,
+    TO_CHAR(jt.membership_fee, 'FM999,999,999,999') AS membership_fee,
+    TO_CHAR(jt.org_contribution_percent, 'FM999.00') AS org_contribution_percent,
+    TO_CHAR(jt.org_contribution_amount, 'FM999,999,999,999') AS org_contribution_amount,
+    TO_CHAR(jt.member_contribution_percent, 'FM999.00') AS member_contribution_percent,
+    TO_CHAR(jt.member_contribution_amount, 'FM999,999,999,999') AS member_contribution_amount,
+    TO_CHAR(jt.org_paid_amount, 'FM999,999,999,999') AS org_paid_amount,
+    TO_CHAR(jt.member_paid_amount, 'FM999,999,999,999') AS member_paid_amount,    
+    TO_CHAR(jt.rate, 'FM999') AS rate,
+    TO_CHAR(jt.interest, 'FM999,999,999,999') AS interest,
+    TO_CHAR(jt.interest + jt.org_paid_amount, 'FM999,999,999,999') AS profit,
+    TO_CHAR(jt.interest + jt.org_paid_amount + jt.member_paid_amount, 'FM999,999,999,999') AS total_amount
+FROM shb.tbl_exit_history y,
+     (
+         SELECT 
+             SUM(jt.membership_fee) AS membership_fee,
+             ROUND(AVG(jt.org_contribution_percent), 2) AS org_contribution_percent,
+             SUM(jt.org_contribution_amount) AS org_contribution_amount,
+             ROUND(AVG(jt.member_contribution_percent), 2) AS member_contribution_percent,
+             SUM(jt.member_contribution_amount) AS member_contribution_amount,
+             SUM(jt.org_paid_amount) AS org_paid_amount,
+             SUM(jt.member_paid_amount) AS member_paid_amount,             
+             ROUND(AVG(jt.rate)) AS rate,
+             SUM(jt.interest) AS interest
+         FROM (
+             SELECT t.yearly_interest
+             FROM TABLE(SHB.FNC_GET_MEMBER_INTEREST_TBL(:gl_person_id)) t
+         ) t_outer,
+         JSON_TABLE (
+             t_outer.yearly_interest,
+             '$[*]' COLUMNS (
+                 membership_fee               NUMBER        PATH '$.membership_fee',
+                 org_contribution_percent     NUMBER        PATH '$.org_contribution_percent',
+                 org_contribution_amount      NUMBER        PATH '$.org_contribution_amount',
+                 member_contribution_percent  NUMBER        PATH '$.member_contribution_percent',
+                 member_contribution_amount   NUMBER        PATH '$.member_contribution_amount',
+                 org_paid_amount              NUMBER        PATH '$.org_paid_amount',
+                 member_paid_amount           NUMBER        PATH '$.member_paid_amount',                 
+                 rate                         NUMBER        PATH '$.rate',
+                 interest                     NUMBER        PATH '$.interest'
+             )
+         ) jt
+     ) jt
+WHERE y.person_id = TO_NUMBER(:gl_person_id);
