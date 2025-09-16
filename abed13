@@ -1,157 +1,24 @@
-WITH src AS (
-  SELECT t.yearly_interest
-  FROM TABLE(SHB.FNC_GET_MEMBER_INTEREST_TBL(:gl_person_id)) t
-),
-flag AS (
-  SELECT CASE 
-           WHEN JSON_EXISTS(yearly_interest,
-                '$[*].monthly_details[*].payments[*]?(@.amount > 0)')
-           THEN 1 ELSE 0 
-         END AS has_pay,
-         yearly_interest
-  FROM src
-),
-bounds AS (
-  SELECT
-    MIN(TO_NUMBER(y) * 100 + m) AS min_key,
-    MAX(TO_NUMBER(y))           AS max_year
-  FROM flag f
-  CROSS JOIN JSON_TABLE(
-    f.yearly_interest,
-    '$[*]' COLUMNS (
-      y VARCHAR2(10) PATH '$.year',
-      NESTED PATH '$.monthly_details[*]' COLUMNS (
-        m NUMBER PATH '$.month',
-        NESTED PATH '$.payments[*]' COLUMNS ( amt NUMBER PATH '$.amount' )
-      )
-    )
-  ) pay
-  WHERE f.has_pay = 1
-    AND NVL(pay.amt,0) > 0
-)
+$src = "C:\path\bigfile.bin"     # مسیر فایل
+$outDir = "C:\path\out"          # پوشه خروجی
+$parts = 10                      # تعداد قسمت‌ها
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-SELECT
-  "سال","ماه","تاریخ پرداخت","روزها",
-  "مبلغ عضویت","سهم عضو","سهم سازمان",
-  "مبلغ پرداختی عضو","مبلغ پرداختی سازمان",
-  "مبلغ قبلی عضو","مبلغ قبلی سازمان",
-  "سود عضو","سود سازمان","سود کل","وضعیت"
-FROM (
-  -- شاخهٔ پرداخت‌دار: همهٔ ماه‌ها تا پایان آخرین سال پرداخت
-  SELECT 
-      jm.year AS "سال",
-      CASE jm.month
-        WHEN 1 THEN 'فروردین' WHEN 2 THEN 'اردیبهشت' WHEN 3 THEN 'خرداد'
-        WHEN 4 THEN 'تیر'     WHEN 5 THEN 'مرداد'     WHEN 6 THEN 'شهریور'
-        WHEN 7 THEN 'مهر'     WHEN 8 THEN 'آبان'      WHEN 9 THEN 'آذر'
-        WHEN 10 THEN 'دی'     WHEN 11 THEN 'بهمن'     WHEN 12 THEN 'اسفند'
-      END AS "ماه",
-      CASE WHEN NVL(jp.payment_type,'none')='none' THEN NULL ELSE jp.payment_date END AS "تاریخ پرداخت",
-      TO_CHAR(jm.days, 'FM999') AS "روزها",
-      TO_CHAR(jm.membership_fee, 'FM999,999,999,999.00') AS "مبلغ عضویت",
-      TO_CHAR(jm.member_amount,  'FM999,999,999,999.00') AS "سهم عضو",
-      TO_CHAR(jm.org_amount,     'FM999,999,999,999.00') AS "سهم سازمان",
-      CASE WHEN jp.payment_type='MEMBER' THEN TO_CHAR(jp.payment_amount, 'FM999,999,999,999.00') ELSE '0.00' END AS "مبلغ پرداختی عضو",
-      CASE WHEN jp.payment_type='ORG'    THEN TO_CHAR(jp.payment_amount, 'FM999,999,999,999.00') ELSE '0.00' END AS "مبلغ پرداختی سازمان",
-      TO_CHAR(jm.prev_member_amount, 'FM999,999,999,999.00') AS "مبلغ قبلی عضو",
-      TO_CHAR(jm.prev_org_amount,    'FM999,999,999,999.00') AS "مبلغ قبلی سازمان",
-      TO_CHAR(
-        CASE WHEN jp.payment_type='ORG'
-             THEN ROUND(jm.prev_member_amount*jm.rate*jm.days /
-                        CASE WHEN MOD(TO_NUMBER(jm.year),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END, 2)
-             ELSE jm.member_interest END,
-        'FM999,999,999,999.00') AS "سود عضو",
-      TO_CHAR(
-        CASE WHEN jp.payment_type='MEMBER'
-             THEN ROUND(jm.prev_org_amount*jm.rate*jm.days /
-                        CASE WHEN MOD(TO_NUMBER(jm.year),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END, 2)
-             ELSE jm.organ_interest END,
-        'FM999,999,999,999.00') AS "سود سازمان",
-      TO_CHAR(
-        (
-          CASE WHEN jp.payment_type='ORG'
-               THEN ROUND(jm.prev_member_amount*jm.rate*jm.days /
-                          CASE WHEN MOD(TO_NUMBER(jm.year),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END, 2)
-               ELSE jm.member_interest END
-        ) +
-        (
-          CASE WHEN jp.payment_type='MEMBER'
-               THEN ROUND(jm.prev_org_amount*jm.rate*jm.days /
-                          CASE WHEN MOD(TO_NUMBER(jm.year),33) IN (1,5,9,13,17,22,26,30) THEN 36600 ELSE 36500 END, 2)
-               ELSE jm.organ_interest END
-        ),
-        'FM999,999,999,999.00') AS "سود کل",
-      CAST(NULL AS VARCHAR2(200 CHAR)) AS "وضعیت",
-      /* کلیدهای سورت عددی */
-      TO_NUMBER(jm.year) AS y_sort,
-      jm.month           AS m_sort,
-      CASE WHEN NVL(jp.payment_type,'none')='none' THEN NULL
-           ELSE TO_DATE(jp.payment_date,'YYYY/MM/DD','nls_calendar=persian')
-      END AS d_sort
-  FROM flag f
-  CROSS JOIN JSON_TABLE(
-    f.yearly_interest,
-    '$[*]' COLUMNS (
-      year            VARCHAR2(10) PATH '$.year',
-      rate            NUMBER       PATH '$.rate',
-      membership_fee  NUMBER       PATH '$.membership_fee',
-      NESTED PATH '$.monthly_details[*]' COLUMNS (
-        month              NUMBER PATH '$.month',
-        days               NUMBER PATH '$.days',
-        member_amount      NUMBER PATH '$.member_amount',
-        org_amount         NUMBER PATH '$.org_amount',
-        member_interest    NUMBER PATH '$.member_interest',
-        organ_interest     NUMBER PATH '$.organ_interest',
-        total_interest     NUMBER PATH '$.total_interest',
-        prev_member_amount NUMBER PATH '$.prev_member_amount',
-        prev_org_amount    NUMBER PATH '$.prev_org_amount'
-      )
-    )
-  ) jm
-  LEFT JOIN JSON_TABLE(
-    f.yearly_interest,
-    '$[*]' COLUMNS (
-      year2 VARCHAR2(10) PATH '$.year',
-      NESTED PATH '$.monthly_details[*]' COLUMNS (
-        month2 NUMBER PATH '$.month',
-        NESTED PATH '$.payments[*]' COLUMNS (
-          payment_type   VARCHAR2(10) PATH '$.type',
-          payment_date   VARCHAR2(10) PATH '$.date',
-          payment_amount NUMBER       PATH '$.amount'
-        )
-      )
-    )
-  ) jp
-    ON jm.year  = jp.year2
-   AND jm.month = jp.month2
-  CROSS JOIN bounds b
-  WHERE f.has_pay = 1
-    AND (TO_NUMBER(jm.year)*100 + jm.month) >= b.min_key
-    AND TO_NUMBER(jm.year) <= b.max_year
+$fs = [System.IO.File]::OpenRead($src)
+$partSize = [math]::Ceiling($fs.Length / $parts)
+$buffer = New-Object byte[] (4MB)
 
-  UNION ALL
-
-  -- شاخهٔ بدون پرداخت: یک ردیف پیام
-  SELECT 
-    CAST(NULL AS VARCHAR2(10)),         -- "سال"
-    CAST(NULL AS VARCHAR2(20)),         -- "ماه"
-    CAST(NULL AS VARCHAR2(10)),         -- "تاریخ پرداخت"
-    CAST(NULL AS VARCHAR2(10)),         -- "روزها"
-    CAST(NULL AS VARCHAR2(30)),         -- "مبلغ عضویت"
-    CAST(NULL AS VARCHAR2(30)),         -- "سهم عضو"
-    CAST(NULL AS VARCHAR2(30)),         -- "سهم سازمان"
-    CAST(NULL AS VARCHAR2(30)),         -- "مبلغ پرداختی عضو"
-    CAST(NULL AS VARCHAR2(30)),         -- "مبلغ پرداختی سازمان"
-    CAST(NULL AS VARCHAR2(30)),         -- "مبلغ قبلی عضو"
-    CAST(NULL AS VARCHAR2(30)),         -- "مبلغ قبلی سازمان"
-    CAST(NULL AS VARCHAR2(30)),         -- "سود عضو"
-    CAST(NULL AS VARCHAR2(30)),         -- "سود سازمان"
-    CAST(NULL AS VARCHAR2(30)),         -- "سود کل"
-    CAST('این عضو تاکنون هیچ پرداختی نداشته است' AS VARCHAR2(200 CHAR)) AS "وضعیت",
-    NULL AS y_sort,
-    NULL AS m_sort,
-    NULL AS d_sort
-  FROM flag
-  WHERE has_pay = 0
-) q
-ORDER BY q.y_sort, q.m_sort, q.d_sort;
+for($i=1; $i -le $parts; $i++){
+  $outPath = Join-Path $outDir ("part_{0:D2}" -f $i)
+  $out = [System.IO.File]::OpenWrite($outPath)
+  $remaining = $partSize
+  while($remaining -gt 0){
+    $toRead = [Math]::Min($remaining, $buffer.Length)
+    $read = $fs.Read($buffer, 0, $toRead)
+    if($read -le 0){break}
+    $out.Write($buffer, 0, $read)
+    $remaining -= $read
+  }
+  $out.Dispose()
+  if($fs.Position -ge $fs.Length){break}
+}
+$fs.Dispose()
